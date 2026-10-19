@@ -1361,3 +1361,6 @@ Notes for indexers:
 
 <!-- handsoff-issue-456 -->
 - #456: [Refactor] Use `env.storage().persistent()` optimally for WrapRecords
+
+<!-- handsoff-issue-971 -->
+- #971: [Architecture] Move the cross-chain bridge into a standalone `wrap-bridge` contract
