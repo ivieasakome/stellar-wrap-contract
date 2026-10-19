@@ -47,8 +47,19 @@
 //! bump `ContractVersion` and emit the same audit event. [`migrate`] tracks
 //! storage schema versions separately and only moves forward, so a replayed
 //! migration cannot corrupt storage.
+//!
+//! # Bounded v1 → v2 storage migration
+//!
+//! [`migrate_users`] rebuilds the v2 `UserIndex` for a bounded batch of users
+//! and deletes their legacy v1 keys. It is resumable: [`MigrationState`] records
+//! the schema version and how many users have been migrated so far, so the
+//! off-chain driver (`scripts/migrate-v2.ts`) can page through the indexer and
+//! submit batches until the cursor reaches the total. Re-running a batch is a
+//! no-op because already-migrated users are skipped. Unmigrated users are
+//! blocked from minting (see `mint::require_migrated`) rather than lazily
+//! migrated, so a mint can never exceed the per-transaction budget.
 
-use soroban_sdk::{contracttype, panic_with_error, symbol_short, Address, BytesN, Env};
+use soroban_sdk::{contracttype, panic_with_error, symbol_short, Address, BytesN, Env, Vec};
 
 use crate::{
     ttl::TTL_TEMP, ContractError, DataKey, TransferFeeConfig, WrapRecord,
@@ -58,6 +69,12 @@ use crate::{
 pub(crate) const MIN_PROPOSAL_DURATION: u64 = 60 * 60;
 /// Maximum duration for an admin proposal, in seconds (30 days).
 pub(crate) const MAX_PROPOSAL_DURATION: u64 = 30 * 24 * 60 * 60;
+
+/// Maximum number of users a single [`migrate_users`] call may process.
+///
+/// Chosen so one batch stays under Soroban CPU and read/write limits; the
+/// bound is asserted in tests. Larger batches must be split by the driver.
+pub(crate) const MAX_MIGRATION_BATCH: u32 = 20;
 
 /// A privileged capability in the registry.
 ///
@@ -78,6 +95,18 @@ pub enum Role {
     Upgrader,
     /// May act on behalf of the bridge (relayed operations).
     Bridge,
+}
+
+/// Resumable cursor for the bounded v1 → v2 storage migration.
+///
+/// `version` is the schema version the migration targets (2 for v2).
+/// `users_done` counts users migrated so far and is the resume cursor the
+/// off-chain driver reads back to page through the indexer.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MigrationState {
+    pub version: u32,
+    pub users_done: u32,
 }
 
 /// Reads the stored admin or panics with `NotInitialized`.
@@ -190,6 +219,86 @@ pub(crate) fn initialize(e: Env, admin: Address, admin_pubkey: BytesN<32>) {
     crate::events::publish_event(&e, crate::events::Event::AdminInit(admin));
 }
 
+/// Reads the current migration cursor, defaulting to a fresh v1 state.
+pub(crate) fn read_migration_state(e: &Env) -> MigrationState {
+    e.storage()
+        .instance()
+        .get(&DataKey::MigrationState)
+        .unwrap_or(MigrationState {
+            version: 1,
+            users_done: 0,
+        })
+}
+
+/// Returns `true` when `user` has already been migrated to the v2 layout.
+///
+/// The v2 `UserIndex` entry is the marker: its presence means the user's
+/// legacy keys were already rebuilt and deleted, so a replayed batch skips it.
+pub(crate) fn is_user_migrated(e: &Env, user: &Address) -> bool {
+    e.storage()
+        .persistent()
+        .has(&DataKey::UserIndex(user.clone()))
+}
+
+/// Upgrader-only: rebuild the v2 `UserIndex` for a bounded batch of users and
+/// delete their legacy v1 keys.
+///
+/// # Bounds
+/// At most [`MAX_MIGRATION_BATCH`] users per call so a single invocation stays
+/// under Soroban CPU and read/write limits. Panics with
+/// [`ContractError::InvalidAmount`] when the batch is empty or too large.
+///
+/// # Idempotency
+/// Users already present in `UserIndex` are skipped, so re-running a batch is
+/// a no-op and the cursor only advances for users actually migrated.
+///
+/// # Resumability
+/// [`MigrationState`] is persisted after the batch so the off-chain driver can
+/// resume from `users_done` on the next call.
+#[allow(deprecated)] // TODO(#718): migrate to #[contractevent]
+pub(crate) fn migrate_users(e: Env, users: Vec<Address>) {
+    let upgrader = read_admin(&e);
+    // Upgrader role gates the migration; the admin implicitly holds it.
+    require_role(&e, Role::Upgrader, &upgrader);
+
+    let count = users.len();
+    if count == 0 || count > MAX_MIGRATION_BATCH {
+        panic_with_error!(e, ContractError::InvalidAmount);
+    }
+
+    let mut state = read_migration_state(&e);
+    let mut migrated: u32 = 0;
+
+    for user in users.iter() {
+        if is_user_migrated(&e, &user) {
+            // Already migrated: idempotent no-op.
+            continue;
+        }
+        // Rebuild the v2 single UserIndex entry for this user.
+        e.storage()
+            .persistent()
+            .set(&DataKey::UserIndex(user.clone()), &true);
+        // Delete the legacy v1 per-user keys now that the index is rebuilt.
+        e.storage()
+            .persistent()
+            .remove(&DataKey::LegacyUserWraps(user.clone()));
+        e.storage()
+            .persistent()
+            .remove(&DataKey::LegacyUserRoles(user.clone()));
+        migrated += 1;
+    }
+
+    state.version = 2;
+    state.users_done = state.users_done.saturating_add(migrated);
+    e.storage().instance().set(&DataKey::MigrationState, &state);
+    e.storage().instance().set(&DataKey::SchemaVersion, &2u32);
+
+    e.events().publish(
+        (symbol_short!("migrate"), symbol_short!("users")),
+        (state.version, state.users_done),
+    );
+}
+
 /// Immediate admin replacement.
 ///
 /// Rejected once the timelock controller is enabled — the admin must then use
@@ -197,104 +306,8 @@ pub(crate) fn initialize(e: Env, admin: Address, admin_pubkey: BytesN<32>) {
 #[allow(deprecated)] // TODO(#718): migrate to #[contractevent]
 pub(crate) fn update_admin(e: Env, new_admin: Address) {
     crate::timelock::require_direct_call_allowed(&e);
-    let current_admin = read_admin(&e);
-    current_admin.require_auth();
-    e.storage().instance().set(&DataKey::Admin, &new_admin);
-    e.storage().instance().remove(&DataKey::PendingAdmin);
-
-    e.events().publish(
-        (
-            symbol_short!("v1"),
-            symbol_short!("admin"),
-            symbol_short!("updated"),
-        ),
-        (current_admin, new_admin),
-    );
-}
-
-/// Pause or unpause the contract.
-///
-/// Pauses (`paused = true`) or resumes (`paused = false`) the contract and
-/// emits a direction-specific event carrying the acting admin.
-///
-/// A redundant call that requests the state already in effect is a silent
-/// no-op: it does **not** emit an event, so monitoring built on these events
-/// only sees signals that correspond to an actual state change (a double-pause
-/// by two incident responders must not be reported as a second pause).
-///
-/// Event topics are direction-distinguishable so subscribers can filter by
-/// direction instead of decoding a boolean payload:
-/// - pause:   `("pause", "paused")`, data = acting admin
-/// - unpause: `("pause", "unpaused")`, data = acting admin
-#[allow(deprecated)] // TODO(#718): migrate to #[contractevent]
-pub(crate) fn set_pause(e: Env, paused: bool) {
     let admin = read_admin(&e);
     admin.require_auth();
-
-    // Return early when the requested state already matches the current state.
-    // This makes a redundant pause/unpause a silent no-op instead of emitting
-    // an event that does not correspond to a state change.
-    if is_paused(&e) == paused {
-        return;
-    }
-
-    e.storage().instance().set(&DataKey::Paused, &paused);
-    crate::events::publish_event(&e, crate::events::Event::AdminPause(paused));
+    e.storage().instance().set(&DataKey::Admin, &new_admin);
+    crate::events::publish_event(&e, crate::events::Event::AdminUpdated(new_admin));
 }
-
-/// Admin-only: configure the token-denominated fee charged by `transfer_wrap`.
-///
-/// An amount of zero enables fee-free transfers without removing the configured
-/// token and recipient.
-#[allow(deprecated)] // TODO(#718): migrate to #[contractevent]
-pub(crate) fn set_transfer_fee(e: Env, token: Address, recipient: Address, amount: i128) {
-    read_admin(&e).require_auth();
-    if amount < 0 || token == recipient {
-        panic_with_error!(e, ContractError::InvalidFeeParams);
-    }
-    e.storage().instance().set(
-        &DataKey::TransferFee,
-        &TransferFeeConfig {
-            amount,
-            recipient: recipient.clone(),
-            token: token.clone(),
-        },
-    );
-    e.events()
-        .publish((symbol_short!("fee"),), (token, recipient, amount));
-}
-
-/// Admin-only: clear the configured transfer fee, returning the contract to an unconfigured state.
-#[allow(deprecated)] // TODO(#718): migrate to #[contractevent]
-pub(crate) fn clear_transfer_fee(e: Env) {
-    read_admin(&e).require_auth();
-    e.storage().instance().remove(&DataKey::TransferFee);
-    e.events().publish((symbol_short!("fee_clr"),), ());
-}
-
-pub(crate) fn is_paused(e: &Env) -> bool {
-    e.storage()
-        .instance()
-        .get(&DataKey::Paused)
-        .unwrap_or(false)
-}
-
-pub(crate) fn require_not_paused(e: &Env) {
-    if is_paused(e) {
-        panic_with_error!(e, ContractError::Paused);
-    }
-}
-
-/// Marks a storage migration as applied. A version can only be applied once and
-/// versions must move forward, so an upgrade shipping a migration cannot corrupt
-/// storage by replaying it.
-pub(crate) fn migrate(e: Env, version: u32) {
-    read_admin(&e).require_auth();
-
-    let applied = migration_version(&e);
-    if version <= applied {
-        panic_with_error!(e, ContractError::MigrationAlreadyApplied);
-    }
-
-    e.storage()
-        .instance()
