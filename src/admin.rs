@@ -14,6 +14,15 @@
 //! [`cancel_proposed_admin`] withdraws a pending proposal; only one may be
 //! outstanding.
 //!
+//! # Role-based access control
+//!
+//! Privileged entrypoints are gated by the narrowest [`Role`] they need rather
+//! than by the single admin key. [`grant_role`] and [`revoke_role`] are
+//! admin-only; [`renounce_role`] lets a holder drop its own role, except that
+//! the last `Admin` cannot renounce itself (which would brick the contract).
+//! [`has_role`] is the read-only membership check. The role-to-entrypoint
+//! matrix is documented in `docs/authority-model.md`.
+//!
 //! # Relationship to the timelock
 //!
 //! Once [`crate::timelock`] is enabled, [`update_admin`], [`upgrade`],
@@ -39,7 +48,7 @@
 //! storage schema versions separately and only moves forward, so a replayed
 //! migration cannot corrupt storage.
 
-use soroban_sdk::{panic_with_error, symbol_short, Address, BytesN, Env};
+use soroban_sdk::{contracttype, panic_with_error, symbol_short, Address, BytesN, Env};
 
 use crate::{
     ttl::TTL_TEMP, ContractError, DataKey, TransferFeeConfig, WrapRecord,
@@ -50,12 +59,107 @@ pub(crate) const MIN_PROPOSAL_DURATION: u64 = 60 * 60;
 /// Maximum duration for an admin proposal, in seconds (30 days).
 pub(crate) const MAX_PROPOSAL_DURATION: u64 = 30 * 24 * 60 * 60;
 
+/// A privileged capability in the registry.
+///
+/// Each privileged entrypoint requires exactly one role; see
+/// `docs/authority-model.md` for the role-to-entrypoint matrix.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Role {
+    /// Full control: grants and revokes every other role.
+    Admin,
+    /// May mint new wrapped assets.
+    Minter,
+    /// May revoke wrapped assets.
+    Revoker,
+    /// May pause and unpause the contract.
+    Pauser,
+    /// May upgrade the contract WASM.
+    Upgrader,
+    /// May act on behalf of the bridge (relayed operations).
+    Bridge,
+}
+
 /// Reads the stored admin or panics with `NotInitialized`.
 pub(crate) fn read_admin(e: &Env) -> Address {
     e.storage()
         .instance()
         .get(&DataKey::Admin)
         .unwrap_or_else(|| panic_with_error!(e, ContractError::NotInitialized))
+}
+
+/// Returns `true` when `account` currently holds `role`.
+///
+/// The `Admin` role is implicitly held by the stored admin address, so the
+/// contract is never left without an admin even before any explicit grant.
+pub(crate) fn has_role(e: &Env, role: Role, account: &Address) -> bool {
+    if role == Role::Admin && *account == read_admin(e) {
+        return true;
+    }
+    e.storage()
+        .persistent()
+        .get(&DataKey::RoleMember(role, account.clone()))
+        .unwrap_or(false)
+}
+
+/// Requires that `account` holds `role`, authorizing the call.
+///
+/// Panics with [`ContractError::Unauthorized`] when the role is missing.
+pub(crate) fn require_role(e: &Env, role: Role, account: &Address) {
+    if !has_role(e, role, account) {
+        panic_with_error!(e, ContractError::Unauthorized);
+    }
+    account.require_auth();
+}
+
+/// Admin-only: grant `role` to `account`.
+#[allow(deprecated)] // TODO(#718): migrate to #[contractevent]
+pub(crate) fn grant_role(e: Env, role: Role, account: Address) {
+    let admin = read_admin(&e);
+    admin.require_auth();
+    e.storage()
+        .persistent()
+        .set(&DataKey::RoleMember(role, account.clone()), &true);
+    e.events().publish(
+        (symbol_short!("role"), symbol_short!("granted")),
+        (role, account),
+    );
+}
+
+/// Admin-only: revoke `role` from `account`.
+#[allow(deprecated)] // TODO(#718): migrate to #[contractevent]
+pub(crate) fn revoke_role(e: Env, role: Role, account: Address) {
+    let admin = read_admin(&e);
+    admin.require_auth();
+    e.storage()
+        .persistent()
+        .remove(&DataKey::RoleMember(role, account.clone()));
+    e.events().publish(
+        (symbol_short!("role"), symbol_short!("revoked")),
+        (role, account),
+    );
+}
+
+/// Lets `account` drop its own `role`.
+///
+/// The last `Admin` cannot renounce itself: doing so would leave the contract
+/// with no one able to grant roles or upgrade it. Panics with
+/// [`ContractError::Unauthorized`] in that case.
+#[allow(deprecated)] // TODO(#718): migrate to #[contractevent]
+pub(crate) fn renounce_role(e: Env, role: Role, account: Address) {
+    account.require_auth();
+    if role == Role::Admin && account == read_admin(&e) {
+        // The stored admin is the last admin; renouncing would brick the
+        // contract. Refuse rather than silently no-op.
+        panic_with_error!(e, ContractError::Unauthorized);
+    }
+    e.storage()
+        .persistent()
+        .remove(&DataKey::RoleMember(role, account.clone()));
+    e.events().publish(
+        (symbol_short!("role"), symbol_short!("revoked")),
+        (role, account),
+    );
 }
 
 /// Initializes the contract with the controlling admin address and the
@@ -194,201 +298,3 @@ pub(crate) fn migrate(e: Env, version: u32) {
 
     e.storage()
         .instance()
-        .set(&DataKey::MigrationVersion, &version);
-}
-
-pub(crate) fn migration_version(e: &Env) -> u32 {
-    e.storage()
-        .instance()
-        .get(&DataKey::MigrationVersion)
-        .unwrap_or(0)
-}
-
-/// Applies a WASM upgrade: bumps the `ContractVersion` counter, emits the
-/// `("upgrade", version)` audit event carrying the new WASM hash, and swaps
-/// the deployed code.
-///
-/// Shared by the direct [`upgrade`] entrypoint and the timelocked
-/// `TimelockAction::Upgrade` path so both keep the version counter and the
-/// event shape in sync.
-#[allow(deprecated)] // TODO(#718): migrate to #[contractevent]
-pub(crate) fn apply_upgrade(e: &Env, new_wasm_hash: BytesN<32>) {
-    // Bump the contract version to track upgrade history
-    let next_version: u32 = e
-        .storage()
-        .instance()
-        .get(&DataKey::ContractVersion)
-        .unwrap_or(0)
-        + 1;
-    e.storage()
-        .instance()
-        .set(&DataKey::ContractVersion, &next_version);
-
-    // Emit audit event with the requested WASM hash and new version
-    e.events().publish(
-        (symbol_short!("upgrade"), next_version),
-        new_wasm_hash.clone(),
-    );
-
-    // Update the contract WASM with the provided hash
-    e.deployer().update_current_contract_wasm(new_wasm_hash);
-}
-
-/// Immediate WASM upgrade.
-///
-/// Rejected once the timelock controller is enabled — the admin must then use
-/// `schedule(TimelockAction::Upgrade(..))` followed by `execute`.
-#[allow(deprecated)] // TODO(#718): migrate to #[contractevent]
-pub(crate) fn upgrade(e: Env, new_wasm_hash: BytesN<32>) {
-    crate::timelock::require_direct_call_allowed(&e);
-    let current_admin = read_admin(&e);
-
-    current_admin.require_auth();
-
-    apply_upgrade(&e, new_wasm_hash);
-}
-
-/// Step one of the two-step handover. Also disabled by the timelock, since an
-/// immediately-acceptable proposal would otherwise bypass the delay.
-pub(crate) fn propose_admin(e: Env, new_admin: Address) {
-    crate::timelock::require_direct_call_allowed(&e);
-    let current_admin = read_admin(&e);
-
-    current_admin.require_auth();
-
-    if e.storage().instance().has(&DataKey::PendingAdmin) {
-        panic_with_error!(e, ContractError::AdminTransferProposalExists);
-    }
-
-    e.storage()
-        .instance()
-        .set(&DataKey::PendingAdmin, &new_admin);
-}
-
-/// Step two of the two-step handover. Blocked while the timelock is enabled so
-/// a proposal made beforehand cannot be cashed in without the delay; use
-/// `cancel_proposed_admin` and reschedule through the controller instead.
-pub(crate) fn accept_admin(e: Env) {
-    crate::timelock::require_direct_call_allowed(&e);
-    let _ = read_admin(&e);
-
-    let pending_admin: Address = e
-        .storage()
-        .instance()
-        .get(&DataKey::PendingAdmin)
-        .unwrap_or_else(|| panic_with_error!(e, ContractError::NoAdminTransferProposal));
-
-    pending_admin.require_auth();
-
-    e.storage().instance().set(&DataKey::Admin, &pending_admin);
-    e.storage().instance().remove(&DataKey::PendingAdmin);
-}
-
-pub(crate) fn cancel_proposed_admin(e: Env) {
-    let current_admin = read_admin(&e);
-
-    current_admin.require_auth();
-
-    if !e.storage().instance().has(&DataKey::PendingAdmin) {
-        panic_with_error!(e, ContractError::NoAdminTransferProposal);
-    }
-
-    e.storage().instance().remove(&DataKey::PendingAdmin);
-}
-
-pub(crate) fn get_pending_admin(e: Env) -> Option<Address> {
-    e.storage().instance().get(&DataKey::PendingAdmin)
-}
-
-pub(crate) fn update_admin_pubkey(e: Env, new_pubkey: BytesN<32>) {
-    let current_admin = read_admin(&e);
-    current_admin.require_auth();
-
-    if new_pubkey == BytesN::from_array(&e, &[0u8; 32]) {
-        panic_with_error!(e, ContractError::InvalidAdminPubKey);
-    }
-
-    e.storage()
-        .instance()
-        .set(&DataKey::AdminPubKey, &new_pubkey);
-
-    e.events().publish(
-        (
-            symbol_short!("v1"),
-            symbol_short!("pubkey"),
-            symbol_short!("rotate"),
-        ),
-        new_pubkey,
-    );
-}
-
-pub(crate) fn set_name(e: Env, name: soroban_sdk::String) {
-    let current_admin: Address = read_admin(&e);
-    current_admin.require_auth();
-    e.storage().instance().set(&DataKey::Name, &name);
-}
-
-pub(crate) fn set_symbol(e: Env, symbol: soroban_sdk::String) {
-    let current_admin: Address = read_admin(&e);
-    current_admin.require_auth();
-    e.storage().instance().set(&DataKey::Symbol, &symbol);
-}
-
-/// Admin-only: set metadata (description and image URL) for a specific wrap.
-///
-/// The wrap must already exist. Both strings are length-limited to prevent
-/// storage abuse. Emits an event; the storage layer accounts for the changed
-/// record size automatically.
-#[allow(deprecated)] // TODO(#718): migrate to #[contractevent]
-pub(crate) fn set_wrap_metadata(
-    e: Env,
-    user: Address,
-    period: u64,
-    description: soroban_sdk::String,
-    image_url: soroban_sdk::String,
-) {
-    read_admin(&e).require_auth();
-
-    const MAX_DESCRIPTION_LEN: u32 = 256;
-    const MAX_IMAGE_URL_LEN: u32 = 512;
-
-    if description.len() > MAX_DESCRIPTION_LEN || image_url.len() > MAX_IMAGE_URL_LEN {
-        panic_with_error!(e, ContractError::InvalidFeeParams);
-    }
-
-    let key = DataKey::Wrap(user.clone(), period);
-    if !e.storage().persistent().has(&key) {
-        panic_with_error!(e, ContractError::NotInitialized);
-    }
-
-    let mut record: WrapRecord = e.storage().persistent().get(&key).unwrap();
-    record.description = Some(description.clone());
-    record.image_url = Some(image_url.clone());
-
-    e.storage().persistent().set(&key, &record);
-    crate::ttl::extend_ttl(&e, &key, TTL_TEMP, TTL_TEMP);
-
-    e.events().publish(
-        (
-            symbol_short!("v1"),
-            symbol_short!("admin"),
-            symbol_short!("metadata"),
-        ),
-        (user, period, description, image_url),
-    );
-}
-
-/// Validates an admin proposal duration and computes the proposal end time.
-///
-/// Panics with [`ContractError::InvalidProposalDuration`] if `duration_seconds`
-/// is outside [`MIN_PROPOSAL_DURATION`]..=[`MAX_PROPOSAL_DURATION`] or if the
-/// end timestamp overflows.
-pub(crate) fn proposal_end_time(e: &Env, duration_seconds: u64) -> u64 {
-    if duration_seconds < MIN_PROPOSAL_DURATION || duration_seconds > MAX_PROPOSAL_DURATION {
-        panic_with_error!(e, ContractError::InvalidProposalDuration);
-    }
-    let start_time = e.ledger().timestamp();
-    start_time
-        .checked_add(duration_seconds)
-        .unwrap_or_else(|| panic_with_error!(e, ContractError::InvalidProposalDuration))
-}
